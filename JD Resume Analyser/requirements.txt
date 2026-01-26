@@ -1,8 +1,0 @@
-streamlit
-python-dotenv
-langchain-groq
-pdfplumber
-pdf2image
-pytesseract
-pillow
-python-docx
