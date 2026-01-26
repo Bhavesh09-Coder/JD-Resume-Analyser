@@ -1,0 +1,22 @@
+google-adk
+dotenv
+elevenlabs
+praw
+fpdf2
+# Groq agent SDK (replace with actual package if official Groq SDK has a different name)
+groq-sdk  
+
+# dotenv for environment variables
+python-dotenv  
+
+# PDF/Word processing for resumes
+pdfplumber
+python-docx
+PyPDF2  
+
+# OCR (if you want image-based PDFs)
+pytesseract 
+pillow  
+
+# Optional: for async/advanced filesystem commands
+anyio
