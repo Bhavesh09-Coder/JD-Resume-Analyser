@@ -1,177 +1,179 @@
+
 import os
-import re
 import asyncio
-from io import BytesIO
+import json
 from dotenv import load_dotenv
+from groq import Groq
+
 from fastmcp import Client
-import google.generativeai as genai
-import pdfplumber
+from fastmcp.client.transports import StdioTransport
 
-# ----------------- CONFIG -----------------
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-ROOT_PATH = r"C:/Users/mansi/OneDrive/Documents/Resume"
 
-SERVERS = {
-    "filesystem": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-filesystem", ROOT_PATH],
-        "cwd": ROOT_PATH,
+def mcp_to_groq_tool(tool):
+    schema = tool.inputSchema
+
+    # Ensure required exists
+    if "required" not in schema:
+        schema["required"] = []
+
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": schema,
+        },
     }
-}
 
-SYSTEM_PROMPT = """
-You are a Resume Analysis Assistant.
 
-Rules:
-- If user asks to list files → respond exactly: ACTION:LIST
-- If user asks to read/open/load a resume → respond exactly: ACTION:READ:<filename>
-- For resume analysis, JD matching, summary, skills, gaps → use the resume content already shared.
-- If JD is provided, compare JD vs Resume and give structured analysis.
-
-Always respond concisely and professionally.
-"""
-
-# ----------------- GLOBAL MEMORY -----------------
-LAST_RESUME_TEXT = ""
-LAST_RESUME_NAME = ""
-
-# ----------------- HELPERS -----------------
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    text = ""
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text.strip()
-
-def get_file_bytes(result):
-    part = result.content[0]
-    if hasattr(part, "blob") and part.blob:
-        return part.blob
-    return part.text.encode()
-
-def extract_filename(action: str) -> str:
-    return action.split("ACTION:READ:")[-1].strip()
-
-def is_jd(text: str) -> bool:
-    keywords = ["job description", "requirements", "responsibilities", "role"]
-    return any(k in text.lower() for k in keywords)
-
-# ----------------- MAIN -----------------
 async def main():
-    global LAST_RESUME_TEXT, LAST_RESUME_NAME
+    transport = StdioTransport(command="python", args=["server.py"])
 
-    async with Client({"mcpServers": SERVERS}) as mcp:
-        print("✅ MCP Connected")
+    async with Client(transport) as mcp:
+        tools = await mcp.list_tools()
+        groq_tools = [mcp_to_groq_tool(t) for t in tools]
 
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            system_instruction=SYSTEM_PROMPT
-        )
-
-        chat = model.start_chat()
+        messages = []
 
         while True:
-            user_input = input("\nUser: ").strip()
+            user_input = input("\nYou: ")
+            messages.append({"role": "user", "content": user_input})
 
-            if not user_input:
-                continue
+            response = groq_client.chat.completions.create(
+                model="qwen/qwen3-32b",
+                messages=messages,
+                tools=groq_tools,
+                tool_choice="auto",
+            )
 
-            response = chat.send_message(user_input).text.strip()
+            msg = response.choices[0].message
 
-            # -------- LIST FILES --------
-            if response == "ACTION:LIST":
-                result = await mcp.call_tool("list_directory", {"path": "."})
-                print("\n📂 Files:\n", result.content[0].text)
-                continue
+            if msg.tool_calls:
+                for call in msg.tool_calls:
+                    tool_name = call.function.name
+                    args = json.loads(call.function.arguments)
 
-            # -------- READ FILE --------
-            if response.startswith("ACTION:READ"):
-                filename = extract_filename(response)
-                result = await mcp.call_tool("read_file", {"path": filename})
-                file_bytes = get_file_bytes(result)
+                    result = await mcp.call_tool(tool_name, args)
 
-                if filename.lower().endswith(".pdf"):
-                    LAST_RESUME_TEXT = extract_pdf_text(file_bytes)
-                else:
-                    LAST_RESUME_TEXT = file_bytes.decode(errors="ignore")
+                    messages.append(msg)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": str(result),
+                    })
 
-                LAST_RESUME_NAME = filename
-
-                chat.send_message(
-                    f"""
-This is the resume content of {filename}.
-Remember it for all future analysis.
-
-RESUME:
-{LAST_RESUME_TEXT}
-"""
+                final = groq_client.chat.completions.create(
+                    model="qwen/qwen3-32b",
+                    messages=messages,
                 )
 
-                print(f"\n✅ Resume loaded: {filename}")
-                continue
+                answer = final.choices[0].message.content
+                print("\nAI:", answer)
+                messages.append({"role": "assistant", "content": answer})
 
-            # -------- JD MATCH / ANALYSIS --------
-            if is_jd(user_input):
-                analysis_prompt = f"""
-Compare the following Resume with the Job Description.
+            else:
+                print("\nAI:", msg.content)
+                messages.append({"role": "assistant", "content": msg.content})
 
-RESUME:
-{LAST_RESUME_TEXT}
 
-JOB DESCRIPTION:
-{user_input}
-
-Provide:
-1. Candidate Summary
-2. Key Skills
-3. Relevant Experience
-4. JD Match Percentage
-5. Skill Gaps
-6. Final Verdict (Fit / Partial / Not Fit)
-"""
-                analysis = chat.send_message(analysis_prompt).text
-                print("\n📊 Analysis:\n", analysis)
-                continue
-
-            # -------- NORMAL QUERY --------
-            print("\nAssistant:", response)
-
-# ----------------- RUN -----------------
 if __name__ == "__main__":
     asyncio.run(main())
 
-# from google.adk.agents.llm_agent import LlmAgent
-# from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioConnectionParams
-# from dotenv import load_dotenv
+server.py
 
-# load_dotenv()
+# server.py
+from fastmcp import FastMCP
+from pathlib import Path
+import pdfplumber
+import fitz  # PyMuPDF
+from docx import Document
+import pytesseract
+from PIL import Image
+import io
 
-# ABSOLUTE_FILE_PATH = r"C:/Users/mansi/OneDrive/Documents/Resume"
+ROOT_DIR = Path(r"C:/Users/mansi/OneDrive/Documents/Resume")
 
-# root_agent = LlmAgent(
-#     model='gemini-2.5-flash',
-#     name='filesystem_assistant_agent',
-#     instruction="""
-#     Help the user manage their files.
-#     You can list files, read files, and analyze resume content.
-#     """,
-#     tools=[
-#         McpToolset(
-#             connection_params=StdioConnectionParams(
-#                 server_params={
-#                     "command": "npx",
-#                     "args": [
-#                         "-y",
-#                         "@modelcontextprotocol/server-filesystem",
-#                         ABSOLUTE_FILE_PATH
-#                     ],
-#                 }
-#             )
-#         )
-#     ],
-# )
+mcp = FastMCP("smart-filesystem-server")
+
+
+def ocr_pdf(path: Path) -> str:
+    text = ""
+    doc = fitz.open(path)
+    for page in doc:
+        pix = page.get_pixmap()
+        img = Image.open(io.BytesIO(pix.tobytes()))
+        text += pytesseract.image_to_string(img)
+    return text
+
+
+def extract_pdf_text(path: Path) -> str:
+    # Try pdfplumber
+    try:
+        with pdfplumber.open(path) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        if text.strip():
+            return text
+    except:
+        pass
+
+    # Try PyMuPDF
+    try:
+        doc = fitz.open(path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        if text.strip():
+            return text
+    except:
+        pass
+
+    # Fallback OCR
+    return ocr_pdf(path)
+
+
+def extract_docx_text(path: Path) -> str:
+    doc = Document(path)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+@mcp.tool()
+def list_files() -> list:
+    """List all files in resume directory"""
+    return [str(p.name) for p in ROOT_DIR.iterdir() if p.is_file()]
+
+
+@mcp.tool()
+def read_file(filename: str) -> str:
+    """Read file content with smart extraction"""
+    path = ROOT_DIR / filename
+
+    if not path.exists():
+        return "File not found"
+
+    suffix = path.suffix.lower()
+
+    # Plain text
+    if suffix in [".txt", ".md"]:
+        return path.read_text(errors="ignore")
+
+    # PDF
+    if suffix == ".pdf":
+        return extract_pdf_text(path)
+
+    # DOCX
+    if suffix == ".docx":
+        return extract_docx_text(path)
+
+    # Fallback OCR for images
+    try:
+        img = Image.open(path)
+        return pytesseract.image_to_string(img)
+    except:
+        return "Unsupported file type"
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
