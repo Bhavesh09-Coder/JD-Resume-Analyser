@@ -1,384 +1,123 @@
+import streamlit as st
 import asyncio
-import json
-from fastmcp import Client
-from groq import Groq
+from mcp_use import MCPAgent, MCPClient
+from langchain_groq import ChatGroq
 
-GROQ_API_KEY = "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"
-groq_client = Groq(api_key=GROQ_API_KEY)
+# --- Configuration & Caching ---
+@st.cache_resource
+def get_mcp_client():
+    client = MCPClient.from_config_file("mcp-config.json")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(client.create_all_sessions())
+    return client, loop
 
-# 🔥 This line auto starts the MCP server
-mcp_client = Client("server.py")
+# --- UI Setup ---
+st.set_page_config(page_title="MCP Assistant", page_icon="💼", layout="wide")
 
-
-def ask_groq(messages, tools=None):
-    try:
-        return groq_client.chat.completions.create(
-            model="qwen/qwen3-32b",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-        )
-    except Exception as e:
-        print("Groq error:", e)
-        return None
-
-
-async def chat():
-    async with mcp_client:
-        print("✅ MCP Server Auto-Started\n")
-
-        tools = await mcp_client.list_tools()
-
-        groq_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.inputSchema,
-                },
-            }
-            for t in tools
-        ]
-
-        messages = []
-
-        while True:
-            user_query = input("Ask Query: ")
-
-            if user_query.lower() in ["exit", "quit"]:
-                break
-
-            messages.append({"role": "user", "content": user_query})
-
-            response = ask_groq(messages, groq_tools)
-            if not response:
-                continue
-
-            msg = response.choices[0].message
-
-            # Tool call
-            if msg.tool_calls:
-                for call in msg.tool_calls:
-                    try:
-                        args = json.loads(call.function.arguments)
-
-                        print(f"\n🔧 Tool: {call.function.name} → {args}\n")
-
-                        result = await mcp_client.call_tool(
-                            call.function.name,
-                            args
-                        )
-
-                        messages.append(msg)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": str(result.data),
-                        })
-
-                    except Exception as e:
-                        print("Tool error:", e)
-
-                final = ask_groq(messages)
-                if final:
-                    answer = final.choices[0].message.content
-                    print("\n🤖:", answer, "\n")
-                    messages.append({"role": "assistant", "content": answer})
-
-            else:
-                answer = msg.content
-                print("\n🤖:", answer, "\n")
-                messages.append({"role": "assistant", "content": answer})
-
-
-asyncio.run(chat())
-
-server.py
-
-# gdrive_mcp_server.py
-from fastmcp import FastMCP
-from googleapiclient.discovery import build
-from google.oauth2.service_account import Credentials
-import io
-import pdfplumber
-import fitz
-
-mcp = FastMCP("GDrive MCP Server")
-
-# -----------------------------
-# Google Drive Init
-# -----------------------------
-try:
-    SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = Credentials.from_service_account_file(
-        "credentials.json", scopes=SCOPES
-    )
-    drive = build("drive", "v3", credentials=creds)
-except Exception as e:
-    drive = None
-    print("❌ Drive init failed:", e)
-
-
-# -----------------------------
-# PDF Extraction
-# -----------------------------
-def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
-    text = ""
-
-    # pdfplumber
-    try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-    except Exception as e:
-        print("pdfplumber failed:", e)
-
-    # pymupdf fallback
-    if not text.strip():
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for page in doc:
-                text += page.get_text()
-        except Exception as e:
-            print("pymupdf failed:", e)
-
-    return text or "No text extracted from PDF"
-
-
-# -----------------------------
-# MCP TOOLS
-# -----------------------------
-@mcp.tool
-def list_files() -> list:
-    """List files from Google Drive"""
-    try:
-        if not drive:
-            return [{"error": "Drive not initialized"}]
-
-        results = drive.files().list(
-            pageSize=10,
-            fields="files(id, name)"
-        ).execute()
-
-        return results.get("files", [])
-
-    except Exception as e:
-        return [{"error": str(e)}]
-
-
-@mcp.tool
-def read_file(file_id: str, file_name: str) -> str:
-    """Read file and extract text"""
-    try:
-        if not drive:
-            return "Drive not initialized"
-
-        request = drive.files().get_media(fileId=file_id)
-        file_bytes = request.execute()
-
-        if file_name.lower().endswith(".pdf"):
-            return extract_text_from_pdf_bytes(file_bytes)
-
-        # txt / md
-        try:
-            return file_bytes.decode("utf-8")
-        except Exception:
-            return "Unsupported or binary file type"
-
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
-
-
-# -----------------------------
-# RUN SERVER
-# -----------------------------
-if __name__ == "__main__":
-    try:
-        mcp.run()
-    except Exception as e:
-        print("❌ MCP Server crashed:", e)
-
-
-
-
-
-import os
-import asyncio
-import json
-from dotenv import load_dotenv
-from groq import Groq
-
-from fastmcp import Client
-from fastmcp.client.transports import StdioTransport
-
-load_dotenv()
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-
-def mcp_to_groq_tool(tool):
-    schema = tool.inputSchema
-
-    # Ensure required exists
-    if "required" not in schema:
-        schema["required"] = []
-
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": schema,
-        },
+# --- Custom Styling (Black Sidebar, White Font, Professional UI) ---
+st.markdown("""
+    <style>
+    /* Sidebar Background and Font */
+    [data-testid="stSidebar"] {
+        background-color: #000000;
+        color: #ffffff;
+    }
+    [data-testid="stSidebar"] * {
+        color: #ffffff !important;
+        font-family: 'Inter', 'Segoe UI', sans-serif;
+    }
+    
+    /* Suggestion Cards */
+    .suggestion-card {
+        background-color: #1a1a1a;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid #333;
+        margin-bottom: 10px;
+        font-size: 0.9rem;
     }
 
+    /* Chat Styling */
+    .stChatMessage { border-radius: 12px; }
+    </style>
+""", unsafe_allow_html=True)
 
-async def main():
-    transport = StdioTransport(command="python", args=["server.py"])
+# --- Sidebar Content ---
+with st.sidebar:
+    st.title("💼 Assistant")
+    st.markdown("---")
+    
+    st.subheader("💡 Suggestions")
+    
+    # Professional Suggestions
+    suggestions = [
+        "📂 **Filesystem**: 'List the files in my directory.'",
+        "📖 **Analysis**: 'Read the contents of requirements.txt.'",
+        "🧮 **Math**: 'Calculate the square root of 144 plus 50.'",
+        "💬 **General**: 'How can I optimize my Python project?'"
+    ]
+    
+    for s in suggestions:
+        st.markdown(f'<div class="suggestion-card">{s}</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.caption("Connected via Model Context Protocol")
 
-    async with Client(transport) as mcp:
-        tools = await mcp.list_tools()
-        groq_tools = [mcp_to_groq_tool(t) for t in tools]
+# --- Initialization ---
+client, mcp_loop = get_mcp_client()
 
-        messages = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-        while True:
-            user_input = input("\nYou: ")
-            messages.append({"role": "user", "content": user_input})
+# --- Main Screen Welcome ---
+if not st.session_state.messages:
+    st.title("Hi, I'm your MCP Assistant")
+    st.markdown("""
+    I'm a professional agent equipped with real-time access to your local tools and environment.
+    You can ask me to **manage files**, **perform calculations**, or simply ask **general questions**.
+    
+    *Type a command below to get started.*
+    """)
+    st.divider()
 
-            response = groq_client.chat.completions.create(
-                model="qwen/qwen3-32b",
-                messages=messages,
-                tools=groq_tools,
-                tool_choice="auto",
-            )
+# Display Chat History
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-            msg = response.choices[0].message
+# --- Agent Logic ---
+async def execute_agent_task(prompt):
+    llm = ChatGroq(
+        model="qwen/qwen3-32b",
+        api_key="123",
+        temperature=0
+    )
+    agent = MCPAgent(
+        llm=llm,
+        client=client,
+        system_prompt="You are a professional assistant. Use MCP tools only when necessary. If a question is normal, answer directly.",
+        max_steps=10
+    )
+    return await agent.run(prompt)
 
-            if msg.tool_calls:
-                for call in msg.tool_calls:
-                    tool_name = call.function.name
-                    args = json.loads(call.function.arguments)
+# --- Chat Input & Thinking in Chat ---
+if prompt := st.chat_input("Message your assistant..."):
+    # User Message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-                    result = await mcp.call_tool(tool_name, args)
+    # Assistant Response
+    with st.chat_message("assistant"):
+        # The spinner/status is now inside the chat
+        with st.status("Thinking...", expanded=False) as status:
+            try:
+                response = mcp_loop.run_until_complete(execute_agent_task(prompt))
+                status.update(label="Response generated", state="complete")
+            except Exception as e:
+                status.update(label="Error", state="error")
+                response = f"I apologize, I encountered an error: {str(e)}"
 
-                    messages.append(msg)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": str(result),
-                    })
-
-                final = groq_client.chat.completions.create(
-                    model="qwen/qwen3-32b",
-                    messages=messages,
-                )
-
-                answer = final.choices[0].message.content
-                print("\nAI:", answer)
-                messages.append({"role": "assistant", "content": answer})
-
-            else:
-                print("\nAI:", msg.content)
-                messages.append({"role": "assistant", "content": msg.content})
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-server.py
-
-# server.py
-from fastmcp import FastMCP
-from pathlib import Path
-import pdfplumber
-import fitz  # PyMuPDF
-from docx import Document
-import pytesseract
-from PIL import Image
-import io
-
-ROOT_DIR = Path(r"C:/Users/mansi/OneDrive/Documents/Resume")
-
-mcp = FastMCP("smart-filesystem-server")
-
-
-def ocr_pdf(path: Path) -> str:
-    text = ""
-    doc = fitz.open(path)
-    for page in doc:
-        pix = page.get_pixmap()
-        img = Image.open(io.BytesIO(pix.tobytes()))
-        text += pytesseract.image_to_string(img)
-    return text
-
-
-def extract_pdf_text(path: Path) -> str:
-    # Try pdfplumber
-    try:
-        with pdfplumber.open(path) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        if text.strip():
-            return text
-    except:
-        pass
-
-    # Try PyMuPDF
-    try:
-        doc = fitz.open(path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        if text.strip():
-            return text
-    except:
-        pass
-
-    # Fallback OCR
-    return ocr_pdf(path)
-
-
-def extract_docx_text(path: Path) -> str:
-    doc = Document(path)
-    return "\n".join(p.text for p in doc.paragraphs)
-
-
-@mcp.tool()
-def list_files() -> list:
-    """List all files in resume directory"""
-    return [str(p.name) for p in ROOT_DIR.iterdir() if p.is_file()]
-
-
-@mcp.tool()
-def read_file(filename: str) -> str:
-    """Read file content with smart extraction"""
-    path = ROOT_DIR / filename
-
-    if not path.exists():
-        return "File not found"
-
-    suffix = path.suffix.lower()
-
-    # Plain text
-    if suffix in [".txt", ".md"]:
-        return path.read_text(errors="ignore")
-
-    # PDF
-    if suffix == ".pdf":
-        return extract_pdf_text(path)
-
-    # DOCX
-    if suffix == ".docx":
-        return extract_docx_text(path)
-
-    # Fallback OCR for images
-    try:
-        img = Image.open(path)
-        return pytesseract.image_to_string(img)
-    except:
-        return "Unsupported file type"
-
-
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-
+        st.markdown(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
